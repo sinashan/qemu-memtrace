@@ -20,6 +20,12 @@
 #ifndef I386_CPU_INTERNAL_H
 #define I386_CPU_INTERNAL_H
 
+#if !defined(CONFIG_USER_ONLY) && defined(CONFIG_TCG) && defined(CONFIG_PLUGIN)
+struct qemu_plugin_x86_walk;
+void x86_cpu_plugin_paging_walk(CPUState *cpu, uint64_t va,
+                               struct qemu_plugin_x86_walk *result);
+#endif
+
 typedef enum FeatureWordType {
    CPUID_FEATURE_WORD,
    MSR_FEATURE_WORD,

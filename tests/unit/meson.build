@@ -24,6 +24,7 @@ tests = {
   'test-resv-mem': [],
   # all code tested by test-x86-topo is inside topology.h
   'test-x86-topo': [],
+  'test-x86-plugin-paging': [],
   'test-cutils': [],
   'test-div128': [],
   'test-shift128': [],

@@ -45,6 +45,7 @@
 #ifndef CONFIG_USER_ONLY
 #include "qemu/plugin-memory.h"
 #include "hw/boards.h"
+#include "hw/core/sysemu-cpu-ops.h"
 #else
 #include "qemu.h"
 #ifdef CONFIG_LINUX
@@ -301,6 +302,30 @@ struct qemu_plugin_hwaddr *qemu_plugin_get_hwaddr(qemu_plugin_meminfo_t info,
 #else
     return NULL;
 #endif
+}
+
+bool qemu_plugin_x86_paging_walk(unsigned int vcpu_index, uint64_t vaddr,
+                               struct qemu_plugin_x86_walk *result)
+{
+    if (!result) {
+        return false;
+    }
+    memset(result, 0, sizeof(*result));
+    result->status = QEMU_PLUGIN_X86_WALK_UNAVAILABLE;
+#ifdef CONFIG_SOFTMMU
+    CPUState *cpu = current_cpu;
+    const SysemuCPUOps *ops;
+
+    if (!cpu || cpu->cpu_index != vcpu_index) {
+        return false;
+    }
+    ops = CPU_GET_CLASS(cpu)->sysemu_ops;
+    if (ops && ops->plugin_x86_paging_walk) {
+        ops->plugin_x86_paging_walk(cpu, vaddr, result);
+        return true;
+    }
+#endif
+    return false;
 }
 
 bool qemu_plugin_hwaddr_is_io(const struct qemu_plugin_hwaddr *haddr)

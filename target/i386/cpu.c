@@ -7922,6 +7922,9 @@ static Property x86_cpu_properties[] = {
 #include "hw/core/sysemu-cpu-ops.h"
 
 static const struct SysemuCPUOps i386_sysemu_ops = {
+#if defined(CONFIG_TCG) && defined(CONFIG_PLUGIN) && defined(TARGET_X86_64)
+    .plugin_x86_paging_walk = x86_cpu_plugin_paging_walk,
+#endif
     .get_memory_mapping = x86_cpu_get_memory_mapping,
     .get_paging_enabled = x86_cpu_get_paging_enabled,
     .get_phys_page_attrs_debug = x86_cpu_get_phys_page_attrs_debug,

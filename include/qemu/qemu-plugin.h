@@ -656,6 +656,57 @@ int qemu_plugin_n_max_vcpus(void);
 QEMU_PLUGIN_API
 void qemu_plugin_outs(const char *string);
 
+/*
+ * EXPERIMENTAL local extension, not an upstream QEMU 8.2 API/ABI promise.
+ * Only call from a full-system x86-64 TCG memory callback, with that callback's
+ * vCPU index. Copies current guest state and observational RAM-only entries.
+ * No faults, A/D updates, TLB fills, or device reads. This is a fresh walk
+ * after the access, not a permission/fault validator or cached-translation
+ * history. Other vCPUs may change tables between entry reads.
+ */
+enum qemu_plugin_x86_walk_status {
+    QEMU_PLUGIN_X86_WALK_OK,
+    QEMU_PLUGIN_X86_WALK_UNAVAILABLE,
+    QEMU_PLUGIN_X86_WALK_UNSUPPORTED_MODE,
+    QEMU_PLUGIN_X86_WALK_UNSUPPORTED_LA57,
+    QEMU_PLUGIN_X86_WALK_UNSUPPORTED_NESTED,
+    QEMU_PLUGIN_X86_WALK_UNSUPPORTED_A20,
+    QEMU_PLUGIN_X86_WALK_UNSUPPORTED_PHYS_BITS,
+    QEMU_PLUGIN_X86_WALK_NONCANONICAL,
+    QEMU_PLUGIN_X86_WALK_NONPRESENT,
+    QEMU_PLUGIN_X86_WALK_RESERVED_CR3,
+    QEMU_PLUGIN_X86_WALK_RESERVED_ENTRY,
+    QEMU_PLUGIN_X86_WALK_NOT_RAM,
+    QEMU_PLUGIN_X86_WALK_READ_FAILED,
+};
+
+struct qemu_plugin_x86_paging {
+    uint64_t cr3, root_pa, cr0, cr4, efer;
+    uint32_t phys_bits;
+    bool page1g;
+};
+
+struct qemu_plugin_x86_pte {
+    uint32_t level;                 /* 4=PML4, 3=PDPT, 2=PD, 1=PT */
+    uint64_t entry_pa, value;
+};
+
+struct qemu_plugin_x86_walk {
+    struct qemu_plugin_x86_paging paging;
+    enum qemu_plugin_x86_walk_status status;
+    uint32_t n_entries;             /* successfully read entries, in order */
+    struct qemu_plugin_x86_pte entries[4];
+    uint64_t leaf_size, pa;         /* valid only for WALK_OK */
+};
+
+/* Returns true if state was captured, even if the walk status is not OK.
+ * False means unavailable (wrong context/vCPU/target, or user emulation).
+ * The caller owns the entire copied result; no temporary handles escape.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_x86_paging_walk(unsigned int vcpu_index, uint64_t vaddr,
+                               struct qemu_plugin_x86_walk *result);
+
 /**
  * qemu_plugin_bool_parse() - parses a boolean argument in the form of
  * "<argname>=[on|yes|true|off|no|false]"

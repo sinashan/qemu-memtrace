@@ -12,10 +12,15 @@
 
 #include "hw/core/cpu.h"
 
+struct qemu_plugin_x86_walk;
+
 /*
  * struct SysemuCPUOps: System operations specific to a CPU class
  */
 typedef struct SysemuCPUOps {
+    /* Experimental diagnostic hook; only x86-64 TCG supplies it. */
+    void (*plugin_x86_paging_walk)(CPUState *cpu, uint64_t vaddr,
+                                  struct qemu_plugin_x86_walk *result);
     /**
      * @get_memory_mapping: Callback for obtaining the memory mappings.
      */
