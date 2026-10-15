@@ -6,15 +6,15 @@ the memory/event CSV formats are preserved. The optional argument
 `walks=/absolute/path/to/walks.csv` opens a separate host file during plugin
 installation. Empty/relative paths, duplicates, user-mode/non-x86-64 targets,
 and open/header errors are rejected. Use distinct memory, event, and walk files.
-Runtime write/flush errors diagnose an incomplete sidecar on stderr and disable
-further sidecar output while guest execution and memory recording continue.
-The walk file uses a 1 MiB fully buffered stream. Each record write is checked;
-the header flushes during installation and records flush at accepted END,
-LIMIT, and shutdown/EXIT boundaries, including immediate-mode limit exhaustion
-and shutdown. Flush and close failures mark the sidecar incomplete. After a
-diagnosed failure there are no further writes or explicit flush attempts;
-the stream is still closed and its buffer freed. An interrupted or crashed
-run can lose buffered walk records; normal boundaries and shutdown flush them.
+Runtime write/flush/close errors diagnose an incomplete capture on stderr and
+permanently stop recording while guest execution continues. A healthy event
+sink receives terminal ERROR instead of a successful END/LIMIT/EXIT.
+The raw walk writer uses a checked 64 KiB stdio buffer; its header flushes on
+installation and records flush at END, LIMIT and exit. The reusable writer can
+also emit XZ directly; see [compression.md](compression.md) for framing,
+exclusive new-file creation, bounded memory, and failure/completion checks.
+No writes or explicit flushes are retried after a diagnosed writer failure,
+beyond necessary fclose cleanup. Interrupted runs may be incomplete.
 
 ## Public API and internal hook
 

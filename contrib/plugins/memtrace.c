@@ -5,7 +5,8 @@
  * No TLB simulation, fault detection, address-space tracking, binary
  * output or timing model. PA need not identify a unique address space.
  * Sequence numbers describe cross-vCPU callback serialization, not
- * simulated hardware timing. Output requires QEMU's -d plugin (and -D).
+ * simulated hardware timing. Default memory output requires -d plugin/-D;
+ * optional dedicated writers provide checked raw or lossless streaming XZ.
  */
 #include <glib.h>
 #include <errno.h>
@@ -14,11 +15,14 @@
 #include <string.h>
 
 #include <qemu-plugin.h>
+#include "memtrace-writer.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 static GMutex trace_lock;
 static uint64_t limit = 1000;
+/* Immutable after installation; zero remains a numeric cap, not a sentinel. */
+static bool unlimited;
 static uint64_t sequence;
 static GHashTable *pcs;
 static bool marker_mode;
@@ -27,10 +31,13 @@ static const char *events_path;
 static bool events_failed;
 static uint64_t event_id;
 static uint64_t interval_id;
-static FILE *walks_file;
+static TraceWriter memory_writer, walks_writer;
+static const char *memory_path;
+static bool compression_xz;
+static unsigned int compression_level = 3;
+static bool output_failed;
 static const char *walks_path;
-static bool walks_failed;
-static char *walks_buffer;
+
 /* Access these flags only through GLib atomics, including under the lock. */
 static gint recording;
 static gint exhausted;
@@ -43,12 +50,12 @@ static const unsigned char end_marker[8] = {
 
 static void events_error(const char *operation)
 {
-    fprintf(stderr, "memtrace: events %s failed for '%s': %s\n",
+    fprintf(stderr, "memtrace: events %s failed for '%s': %s; capture incomplete\n",
             operation, events_path, strerror(errno ? errno : EIO));
 }
 
 /* Caller holds trace_lock. A failed sink is diagnosed once and disabled;
- * guest execution and memory recording continue, but events are incomplete.
+ * callers permanently disable recording on failure; events are incomplete.
  */
 static void emit_event(const char *event, unsigned int cpu, bool has_cpu)
 {
@@ -69,22 +76,30 @@ static void emit_event(const char *event, unsigned int cpu, bool has_cpu)
     }
 }
 
-static void walks_error(const char *operation)
+/* Caller holds trace_lock. Never advertise a successful boundary after failure.
+ * ERROR is a terminal event with unchanged CSV columns. If events itself has
+ * failed, stderr is the only reliable failure channel. Guest execution continues.
+ */
+static void output_error(unsigned int cpu, bool has_cpu)
 {
-    fprintf(stderr, "memtrace: walks %s failed for '%s': %s\n",
-            operation, walks_path, strerror(errno ? errno : EIO));
-    walks_failed = true;
+    if (output_failed) {
+        return;
+    }
+    output_failed = true;
+    g_atomic_int_set(&recording, false);
+    g_atomic_int_set(&exhausted, true);
+    emit_event("ERROR", cpu, has_cpu);
 }
 
-/* Caller holds trace_lock. Never retry a diagnosed stream failure. */
-static void flush_walks(void)
+static bool flush_outputs(unsigned int cpu, bool has_cpu)
 {
-    if (walks_file && !walks_failed) {
-        errno = 0;
-        if (fflush(walks_file) != 0) {
-            walks_error("flush");
-        }
+    bool memory_ok = writer_boundary(&memory_writer);
+    bool walks_ok = writer_boundary(&walks_writer);
+    if (!memory_ok || !walks_ok || events_failed) {
+        output_error(cpu, has_cpu);
+        return false;
     }
+    return true;
 }
 
 static const char *walk_status(enum qemu_plugin_x86_walk_status status)
@@ -152,9 +167,8 @@ static void emit_walk(unsigned int cpu, uint64_t va, bool has_pa, uint64_t pa)
                                pte->entry_pa, pte->value);
     }
     g_string_append(row, "\"\n");
-    errno = 0;
-    if (fputs(row->str, walks_file) == EOF) {
-        walks_error("write");
+    if (!writer_write(&walks_writer, row->str, row->len)) {
+        output_error(cpu, true);
     }
     g_string_free(row, true);
 }
@@ -170,6 +184,9 @@ static void marker_begin(unsigned int cpu, void *userdata)
         interval_id++;
         g_atomic_int_set(&recording, true);
         emit_event("BEGIN", cpu, true);
+        if (events_failed) {
+            output_error(cpu, true);
+        }
     }
     g_mutex_unlock(&trace_lock);
 }
@@ -179,8 +196,12 @@ static void marker_end(unsigned int cpu, void *userdata)
     g_mutex_lock(&trace_lock);
     if (g_atomic_int_get(&recording)) {
         g_atomic_int_set(&recording, false);
-        flush_walks();
-        emit_event("END", cpu, true);
+        if (flush_outputs(cpu, true)) {
+            emit_event("END", cpu, true);
+            if (events_failed) {
+                output_error(cpu, true);
+            }
+        }
     }
     g_mutex_unlock(&trace_lock);
 }
@@ -196,11 +217,12 @@ static void vcpu_mem(unsigned int cpu, qemu_plugin_meminfo_t info,
     uint64_t callback_pa = 0;
 
     /* QEMU invokes memory callbacks after successful loads/stores only. */
-    if (!g_atomic_int_get(&recording)) {
+    if (!g_atomic_int_get(&recording) || g_atomic_int_get(&exhausted)) {
         return;
     }
     g_mutex_lock(&trace_lock);
-    if (!g_atomic_int_get(&recording) || sequence == limit) {
+    if (!g_atomic_int_get(&recording) || g_atomic_int_get(&exhausted) ||
+        (!unlimited && sequence == limit)) {
         g_mutex_unlock(&trace_lock);
         return;
     }
@@ -220,18 +242,40 @@ static void vcpu_mem(unsigned int cpu, qemu_plugin_meminfo_t info,
              UINT64_C(1) << qemu_plugin_mem_size_shift(info),
              qemu_plugin_mem_is_store(info) ? 'W' : 'R', memory_type);
     /* Keep allocation of numbers and whole-record output in one lock. */
-    qemu_plugin_outs(record);
-    if (walks_file && !walks_failed) {
+    if (memory_writer.file) {
+        if (!writer_write(&memory_writer, record, strlen(record))) {
+            output_error(cpu, true);
+        }
+    } else {
+        qemu_plugin_outs(record);
+    }
+    if (walks_writer.file && !output_failed) {
         emit_walk(cpu, vaddr, hwaddr != NULL, callback_pa);
     }
-    if (sequence == limit) {
+    if (output_failed) {
+        g_mutex_unlock(&trace_lock);
+        return;
+    }
+    if (!unlimited && sequence == limit) {
         g_atomic_int_set(&recording, false);
         g_atomic_int_set(&exhausted, true);
-        flush_walks();
-        if (marker_mode) {
+        if (flush_outputs(cpu, true) && marker_mode) {
             /* The final access callback supplies the applicable vCPU ID. */
             emit_event("LIMIT", cpu, true);
+            if (events_failed) {
+                output_error(cpu, true);
+            }
         }
+    } else if (sequence == UINT64_MAX) {
+        /* Never wrap the next sequence to zero. This representational failure
+         * is not a configured LIMIT. Leave the interval active so its actual
+         * END (or plugin EXIT) can close it, but permanently suppress accesses
+         * and later BEGINs. The stderr diagnostic marks the capture incomplete.
+         */
+        g_atomic_int_set(&exhausted, true);
+        flush_outputs(cpu, true);
+        fprintf(stderr, "memtrace: access sequence counter exhausted at "
+                "UINT64_MAX; further recording disabled; capture incomplete\n");
     }
     g_mutex_unlock(&trace_lock);
 }
@@ -240,7 +284,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     size_t n = qemu_plugin_tb_n_insns(tb);
 
-    if (g_atomic_int_get(&exhausted)) {
+    if (g_atomic_int_get(&exhausted) && !marker_mode) {
         return;
     }
     for (size_t i = 0; i < n; i++) {
@@ -262,6 +306,12 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                     insn, cb, QEMU_PLUGIN_CB_NO_REGS, NULL);
                 continue;
             }
+        }
+        /* Even after counter exhaustion, instrument END so it can close an
+         * unlimited interval. Numeric exhaustion already closed with LIMIT.
+         */
+        if (g_atomic_int_get(&exhausted)) {
+            continue;
         }
         addr = qemu_plugin_insn_vaddr(insn);
         g_mutex_lock(&trace_lock);
@@ -291,9 +341,14 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 static void plugin_exit(qemu_plugin_id_t id, void *userdata)
 {
     g_mutex_lock(&trace_lock);
-    /* Also flush immediate mode and intervals already closed by END/LIMIT. */
-    flush_walks();
-    if (marker_mode && g_atomic_int_get(&recording)) {
+    bool was_active = g_atomic_int_get(&recording);
+    flush_outputs(0, false);
+    bool memory_ok = writer_close(&memory_writer);
+    bool walks_ok = writer_close(&walks_writer);
+    if (!memory_ok || !walks_ok) {
+        output_error(0, false);
+    }
+    if (marker_mode && was_active && !output_failed) {
         g_atomic_int_set(&recording, false);
         emit_event("EXIT", 0, false);
     }
@@ -301,17 +356,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *userdata)
         errno = 0;
         if (fclose(events_file) != 0) {
             events_error("close");
+            events_failed = true;
         }
         events_file = NULL;
     }
-    if (walks_file) {
-        errno = 0;
-        if (fclose(walks_file) != 0) {
-            walks_error("close");
-        }
-        walks_file = NULL;
-    }
-    g_clear_pointer(&walks_buffer, g_free);
     g_mutex_unlock(&trace_lock);
     /* The table owns keys; values alias keys and must not be freed twice. */
     g_hash_table_destroy(pcs);
@@ -324,11 +372,41 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 {
     bool seen_limit = false;
     bool seen_roi = false;
+    bool seen_compression = false;
+    bool seen_level = false;
 
     for (int i = 0; i < argc; i++) {
         const char *arg = argv[i];
         uint64_t value = 0;
 
+        if (g_str_has_prefix(arg, "memory=")) {
+            if (memory_path || arg[7] != '/') {
+                goto invalid;
+            }
+            memory_path = arg + 7;
+            continue;
+        }
+        if (g_str_has_prefix(arg, "compression=")) {
+            if (seen_compression) {
+                goto invalid;
+            }
+            if (!strcmp(arg + 12, "xz")) {
+                compression_xz = true;
+            } else if (strcmp(arg + 12, "none")) {
+                goto invalid;
+            }
+            seen_compression = true;
+            continue;
+        }
+        if (g_str_has_prefix(arg, "compression-level=")) {
+            if (seen_level || strlen(arg + 18) != 1 ||
+                arg[18] < '0' || arg[18] > '9') {
+                goto invalid;
+            }
+            compression_level = arg[18] - '0';
+            seen_level = true;
+            continue;
+        }
         if (g_str_has_prefix(arg, "walks=")) {
             if (walks_path || arg[6] != '/') {
                 goto invalid;
@@ -358,6 +436,11 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         if (seen_limit || !g_str_has_prefix(arg, "limit=") || !arg[6]) {
             goto invalid;
         }
+        if (strcmp(arg + 6, "unlimited") == 0) {
+            unlimited = true;
+            seen_limit = true;
+            continue;
+        }
         for (const char *p = arg + 6; *p; p++) {
             if (*p < '0' || *p > '9' ||
                 value > (UINT64_MAX - (*p - '0')) / 10) {
@@ -371,8 +454,9 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 
 invalid:
         fprintf(stderr, "memtrace: invalid argument '%s'; expected "
-                "limit=N (unsigned decimal 0..%" PRIu64 ") or "
-                "roi=immediate|markers, events=PATH or walks=/ABSOLUTE/PATH; "
+                "limit=unlimited or limit=N (unsigned decimal 0..%" PRIu64 ") or "
+                "roi=immediate|markers, events=PATH, memory=/ABSOLUTE/PATH, "
+                "walks=/ABSOLUTE/PATH, compression=none|xz, compression-level=0..9; "
                 "each option at most once\n",
                 arg, UINT64_MAX);
         return -1;
@@ -393,11 +477,18 @@ invalid:
         return -1;
     }
 
-    /* Parse and validate everything before opening a file or registering
-     * callbacks. argv strings remain valid for the plugin lifetime in 8.2.
+    if ((compression_xz && !memory_path) || (seen_level && !compression_xz)) {
+        fprintf(stderr, "memtrace: xz requires memory=/ABSOLUTE/PATH; "
+                "compression-level requires compression=xz\n");
+        return -1;
+    }
+    /* Validate all options before exclusively creating new files. O_EXCL
+     * rejects aliases/hardlinks to any existing output, input or QEMU log.
+     * If two new output names alias, the second creation fails, without
+     * truncating the first. Failed installation leaves identifiable partials.
      */
     if (events_path) {
-        events_file = fopen(events_path, "w");
+        events_file = trace_create(events_path);
         if (!events_file) {
             events_error("open");
             return -1;
@@ -406,55 +497,50 @@ invalid:
         if (fputs("event_id,interval_id,event,cpu,access_sequence\n",
                   events_file) == EOF || fflush(events_file) != 0) {
             events_error("header write/flush");
-            if (fclose(events_file) != 0) {
-                events_error("close");
-            }
-            events_file = NULL;
-            return -1;
+            goto install_failed;
+        }
+    }
+    if (memory_path) {
+        if (!writer_open(&memory_writer, "memory", memory_path,
+                         compression_xz, compression_level)) {
+            goto install_failed;
         }
     }
     if (walks_path) {
-        walks_file = fopen(walks_path, "w");
-        if (!walks_file) {
-            walks_error("open");
+        if (!writer_open(&walks_writer, "walks", walks_path,
+                         compression_xz, compression_level) ||
+            !writer_write(&walks_writer,
+                "sequence,cpu,data_va,cr3,root_pa,cr0,cr4,efer,phys_bits,"
+                "status,leaf_size,reconstructed_pa,callback_pa,comparison,pte_path\n",
+                strlen("sequence,cpu,data_va,cr3,root_pa,cr0,cr4,efer,phys_bits,"
+                "status,leaf_size,reconstructed_pa,callback_pa,comparison,pte_path\n")) ||
+            !writer_boundary(&walks_writer)) {
             goto install_failed;
         }
-        /* Supply storage explicitly: setvbuf(NULL, ...) need not allocate
-         * the requested size on every libc. Keep it live through fclose.
-         */
-        walks_buffer = g_malloc(1024 * 1024);
-        errno = 0;
-        if (setvbuf(walks_file, walks_buffer, _IOFBF, 1024 * 1024) != 0) {
-            walks_error("buffer configuration");
+    }
+    const char *header = "sequence,cpu,pc_va,data_va,data_pa,size_bytes,"
+                         "operation,memory_type\n";
+    if (memory_path) {
+        if (!writer_write(&memory_writer, header, strlen(header)) ||
+            !writer_boundary(&memory_writer)) {
             goto install_failed;
         }
-        errno = 0;
-        if (fputs("sequence,cpu,data_va,cr3,root_pa,cr0,cr4,efer,phys_bits,"
-                  "status,leaf_size,reconstructed_pa,callback_pa,comparison,"
-                  "pte_path\n", walks_file) == EOF || fflush(walks_file) != 0) {
-            walks_error("header write/flush");
-            goto install_failed;
-        }
+    } else {
+        qemu_plugin_outs(header);
     }
 
     g_mutex_init(&trace_lock);
     pcs = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
-    g_atomic_int_set(&recording, !marker_mode && limit != 0);
-    g_atomic_int_set(&exhausted, limit == 0);
-    qemu_plugin_outs("sequence,cpu,pc_va,data_va,data_pa,size_bytes,"
-                     "operation,memory_type\n");
+    g_atomic_int_set(&recording, !marker_mode && (unlimited || limit != 0));
+    g_atomic_int_set(&exhausted, !unlimited && limit == 0);
+
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
     return 0;
 
 install_failed:
-    if (walks_file) {
-        if (fclose(walks_file) != 0) {
-            walks_error("close");
-        }
-        walks_file = NULL;
-    }
-    g_clear_pointer(&walks_buffer, g_free);
+    writer_close(&walks_writer);
+    writer_close(&memory_writer);
     if (events_file) {
         if (fclose(events_file) != 0) {
             events_error("close");

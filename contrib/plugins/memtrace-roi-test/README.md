@@ -2,8 +2,10 @@
 
 `roi=immediate` (default) records from the start as before. `roi=markers`
 starts disabled and requires an x86-64 guest. `limit=N` defaults to 1000;
+`limit=0` records zero accesses. Explicit `limit=unlimited` removes the numeric
+cap; it is stored separately from the numeric value, not encoded as zero.
 options may appear in any order, once each. Optional `events=PATH` writes a
-separate host-side event CSV, opening/truncating the file during installation.
+separate host-side event CSV, exclusively creating a new file during installation.
 An empty path, duplicate option, open failure, or header write failure rejects
 installation. Without this option, behavior is unchanged.
 
@@ -14,8 +16,15 @@ Markers are eight-byte NOPs identified by instruction length and raw bytes:
 
 Recording changes when these instructions execute. BEGIN enables a global
 interval; END disables it. Repeating either marker is harmless. Record numbers
-and the limit are cumulative across intervals. Once the limit is reached,
+and numeric limits are cumulative across intervals. Once a numeric limit is reached,
 BEGIN cannot resume recording. No marker messages or summaries enter the CSV.
+In unlimited mode, END closes the current interval at its current sequence;
+later BEGIN can start another interval, with cumulative numbering and no LIMIT
+event. If the access counter reaches UINT64_MAX, recording is permanently
+suppressed before it can wrap, walks are flushed, and stderr explicitly reports
+an incomplete capture. This is not a configured LIMIT; the active interval is
+still closed by its actual END or plugin EXIT. Numeric UINT64_MAX remains an
+ordinary numeric cap with its usual LIMIT behavior.
 
 The optional event CSV has columns
 `event_id,interval_id,event,cpu,access_sequence`. Event IDs start at 1;
@@ -31,9 +40,10 @@ For BEGIN and its matching END, LIMIT, or EXIT, the interval's memory records
 satisfy `begin.access_sequence < sequence <= close.access_sequence`.
 Marker transitions, event emission, and memory numbering serialize under the
 same mutex. Events flush at each boundary; the file closes at plugin exit.
-Runtime write/flush failures are diagnosed on stderr and disable further event
-writes while the guest and memory recording continue; that event file is
-incomplete. Close errors also go to stderr. Use separate paths for the event
+Runtime write/flush failures are diagnosed on stderr and permanently stop
+recording while the guest continues; that capture is incomplete. A writable
+event sink receives terminal ERROR; an event-sink failure may only be visible
+on stderr. ERROR must not be treated as a normal interval closure. Close errors also go to stderr. Use separate paths for the event
 file and QEMU's `-D` memory log. No events or diagnostics enter the memory CSV.
 This plugin counts records submitted to `qemu_plugin_outs()`; use `-d plugin`
 to ensure the corresponding memory log is enabled.
@@ -45,6 +55,24 @@ This is not process filtering. Any guest code executing these bytes can toggle
 recording. Cross-vCPU ordering reflects callback serialization, not simulated
 hardware timing; inactive callbacks can return via an atomic check, while
 record emission and marker changes serialize under the output mutex.
+
+For whole-command captures, [roi-run.c](roi-run.c) emits BEGIN, forks/execs the
+command, waits for it, and emits END. Child startup, loading, teardown and
+concurrent kernel/other-process activity are included until END. If the wrapper
+is killed before END, the interval may remain active until plugin/QEMU exit;
+unlimited mode does not fix that. No PID polling or process detection is used.
+Unlimited recording neither compresses output nor bounds disk usage. Preserve
+existing captures, choose fresh output paths (existing sidecars are refused),
+and monitor free space, for example `df -h /path/to/capture-directory`.
+Diagnosed sidecar write failures still report errors on stderr and mark the
+sidecar incomplete; do not accept such captures as complete or ignore errors.
+The QEMU-managed memory log retains its existing error handling.
+
+New plugin argument (replace placeholders with fresh host-side absolute paths):
+`roi=markers,limit=unlimited,events=...,walks=...`.
+For GAP BFS, `-g 12` generates 4096 vertices, `-n 1` requests one BFS trial,
+and `-n 4096` requests 4096 trials, not 4096 vertices. Confirm the installed
+guest's help as described in [gap-bfs.md](gap-bfs.md).
 
 Instruction PCs are copied into stable heap storage shared by translations of
 the same PC, retained across TB flushes, and freed at plugin exit. No temporary
@@ -86,6 +114,11 @@ that those regions really are touched. Two intervals exercise repeated
 markers and cumulative numbering; a limit of five also tests that the later
 BEGIN cannot restart recording. Total access counts are not assumed.
 The verifier also checks boundary event order and interval partitions,
+unlimited multi-interval numbering and pre/post exclusion, no unlimited LIMIT,
+immediate unlimited recording, unlimited EXIT, numeric zero and duplicate or
+malformed unlimited options,
+counter overflow using a temporary test-only plugin initialized near UINT64_MAX,
+and numeric UINT64_MAX retaining its ordinary LIMIT transition,
 LIMIT without reopening, EXIT with an active interval, header-only event
 files, malformed arguments, invalid paths, header-write failure, runtime
 boundary-write failure with guest continuation, and that a
@@ -127,3 +160,11 @@ build/qemu-system-x86_64 \
 
 The CSV is written on the host. Running a guest test under a VM that was
 launched without this plugin will not produce a trace.
+
+## Streaming compression
+
+See [compression.md](compression.md) for `compression=xz,compression-level=3,`
+`memory=/absolute/path/memory.csv.xz,walks=/absolute/path/walks.csv.xz`,
+concatenated-stream boundary framing, bounded buffers, terminal ERROR semantics,
+fresh-file protection, launch/runner options and local compression checks.
+Without `memory=`, raw memory output remains through QEMU logging.

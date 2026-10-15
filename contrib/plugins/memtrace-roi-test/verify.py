@@ -4,6 +4,7 @@ import csv
 from pathlib import Path
 import re
 import resource
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -89,6 +90,7 @@ with tempfile.TemporaryDirectory(prefix="memtrace-roi-") as temp:
 
     for name, options, marked in [
         ("marked-loop", ",roi=markers,limit=10000", True),
+        ("unlimited-loop", ",limit=unlimited,roi=markers", True),
         ("immediate-loop", ",limit=100000,roi=immediate", False),
     ]:
         rows, output = run(directory, name, options, GUEST)
@@ -110,6 +112,22 @@ with tempfile.TemporaryDirectory(prefix="memtrace-roi-") as temp:
 
     run_events(directory, "events-two-intervals", ",roi=markers,limit=10000",
                GUEST, ["BEGIN", "END", "BEGIN", "END"])
+    unlimited_rows, _ = run_events(
+        directory, "events-unlimited", ",roi=markers,limit=unlimited",
+        GUEST, ["BEGIN", "END", "BEGIN", "END"])
+    numeric_rows, _ = run_events(
+        directory, "events-numeric-control", ",limit=10000,roi=markers",
+        GUEST, ["BEGIN", "END", "BEGIN", "END"])
+    assert len(unlimited_rows) == len(numeric_rows)
+    run_events(directory, "events-unlimited-no-markers",
+               ",roi=markers,limit=unlimited", "/bin/true", [])
+    immediate_unlimited, _ = run_events(
+        directory, "events-unlimited-immediate", ",limit=unlimited",
+        "/bin/true", [])
+    assert len(immediate_unlimited) > 1000
+    run_events(directory, "events-unlimited-exit",
+               ",roi=markers,limit=unlimited",
+               "build/contrib/plugins/memtrace-exit-active", ["BEGIN", "EXIT"])
     rows, events = run_events(directory, "events-limit", ",roi=markers,limit=5",
                               GUEST, ["BEGIN", "LIMIT"])
     assert len(rows) == 5 and events[-1][4] == "5"
@@ -126,7 +144,10 @@ with tempfile.TemporaryDirectory(prefix="memtrace-roi-") as temp:
                "limit=1,limit=2", "roi=", "roi=unknown", "roi",
                "roi=markers,roi=markers", "roi=immediate,roi=markers",
                "events=", "events=a,events=b", "walks=", "walks=relative.csv",
-               "walks=/tmp/a.csv,walks=/tmp/b.csv"]
+               "walks=/tmp/a.csv,walks=/tmp/b.csv", "limit=Unlimited",
+               "limit=unlimitedx", "limit= unlimited", "limit=unlimited ",
+               "limit=unlimited,limit=1", "limit=0,limit=unlimited",
+               "limit=unlimited,limit=unlimited"]
     for options in invalid:
         result = subprocess.run(
             [QEMU, "-plugin", PLUGIN + "," + options, "/bin/true"],
@@ -134,6 +155,45 @@ with tempfile.TemporaryDirectory(prefix="memtrace-roi-") as temp:
         assert result.returncode != 0
         assert "memtrace: invalid argument" in result.stderr
     print(f"{len(invalid)} invalid argument cases rejected clearly")
+
+    # Test-only counter injection in a temporary plugin: exercising uint64
+    # exhaustion must not require emitting 2**64 records or a production knob.
+    source = Path("contrib/plugins/memtrace.c").read_text()
+    assert source.count("static uint64_t sequence;") == 1
+    overflow_source = directory / "overflow.c"
+    overflow_source.write_text(source.replace(
+        "static uint64_t sequence;",
+        "static uint64_t sequence = UINT64_MAX - 1;"))
+    overflow_plugin = directory / "overflow.so"
+    cflags = shlex.split(subprocess.check_output(
+        ["pkg-config", "--cflags", "glib-2.0"], text=True))
+    subprocess.run(["cc", "-shared", "-fPIC", "-Wall", "-Wextra",
+                    "-Wno-unused-parameter", "-Werror", "-Iinclude/qemu",
+                    "-Icontrib/plugins",
+                    *cflags, str(overflow_source), "-llzma", "-o", str(overflow_plugin)],
+                   check=True)
+    for cap, closing in [("unlimited", "END"),
+                         ("18446744073709551615", "LIMIT")]:
+        memory = directory / ("overflow-" + cap + ".csv")
+        events = directory / ("overflow-" + cap + "-events.csv")
+        result = subprocess.run(
+            [QEMU, "-plugin", str(overflow_plugin) +
+             ",roi=markers,limit=" + cap + ",events=" + str(events),
+             "-d", "plugin", "-D", str(memory), GUEST],
+            capture_output=True, text=True, check=True)
+        with memory.open() as f:
+            records = list(csv.DictReader(f))
+        assert [int(r["sequence"]) for r in records] == [2**64 - 1]
+        with events.open() as f:
+            boundaries = list(csv.DictReader(f))
+        assert [r["event"] for r in boundaries] == ["BEGIN", closing]
+        assert int(boundaries[-1]["access_sequence"]) == 2**64 - 1
+        if cap == "unlimited":
+            assert result.stderr.count("access sequence counter exhausted") == 1
+            assert "capture incomplete" in result.stderr
+        else:
+            assert not result.stderr, result.stderr
+    print("sequence overflow guarded; numeric UINT64_MAX retains LIMIT")
 
     walk_path = directory / "user-walks.csv"
     result = subprocess.run(
@@ -154,7 +214,7 @@ with tempfile.TemporaryDirectory(prefix="memtrace-roi-") as temp:
 
     for path, error in [(directory / "missing" / "events.csv", "open failed"),
                         (directory, "open failed"),
-                        (Path("/dev/full"), "header write/flush failed")]:
+                        (Path("/dev/full"), "open failed")]:
         result = subprocess.run(
             [QEMU, "-plugin", PLUGIN + ",events=" + str(path), "/bin/true"],
             capture_output=True, text=True)
@@ -174,7 +234,7 @@ with tempfile.TemporaryDirectory(prefix="memtrace-roi-") as temp:
     assert result.returncode == 0, result.stderr
     assert result.stderr.count("events write/flush failed") == 1, result.stderr
     assert "pre=" in result.stdout
-    print("runtime boundary write failure diagnosed once; guest completed")
+    print("runtime boundary write failure diagnosed once; recording stopped; guest completed")
 
     # Some checkouts also build i386 user emulation; installation must reject
     # its architecture before attempting to load the x86-64 guest executable.
