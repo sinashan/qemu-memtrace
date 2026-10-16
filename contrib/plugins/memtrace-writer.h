@@ -1,4 +1,4 @@
-/* Synchronous bounded CSV writer. SPDX-License-Identifier: GPL-2.0-or-later */
+/* Synchronous bounded byte writer (CSV or binary). SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef MEMTRACE_WRITER_H
 #define MEMTRACE_WRITER_H
 #include <errno.h>
@@ -137,8 +137,9 @@ static bool writer_write(TraceWriter *w, const char *data, size_t size)
     return true;
 }
 
-/* Finalized concatenated XZ streams: a header stream followed by nonempty
- * interval streams. No unbounded pending queue; empty intervals add no stream.
+/* Finalize the current XZ segment for concatenated-stream boundary visibility.
+ * The caller supplies one logical header and, for binary, one final footer.
+ * No unbounded pending queue; a boundary with no pending bytes adds no stream.
  * fflush gives codec/stdio completion, NOT fsync durability.
  */
 static bool writer_boundary(TraceWriter *w)

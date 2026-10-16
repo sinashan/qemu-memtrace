@@ -2,8 +2,8 @@
  * Successful data-memory accesses as CSV, for user and system TCG.
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * No TLB simulation, fault detection, address-space tracking, binary
- * output or timing model. PA need not identify a unique address space.
+ * CSV and experimental inline binary capture. No TLB simulation, fault
+ * detection, address-space tracking or timing model. PA need not identify a unique address space.
  * Sequence numbers describe cross-vCPU callback serialization, not
  * simulated hardware timing. Default memory output requires -d plugin/-D;
  * optional dedicated writers provide checked raw or lossless streaming XZ.
@@ -16,6 +16,7 @@
 
 #include <qemu-plugin.h>
 #include "memtrace-writer.h"
+#include "memtrace-binary.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
@@ -37,6 +38,11 @@ static bool compression_xz;
 static unsigned int compression_level = 3;
 static bool output_failed;
 static const char *walks_path;
+static bool binary_mode, test_dual;
+static const char *binary_path;
+static size_t binary_chunk = 4 * 1024 * 1024;
+static TraceBinary binary_sink;
+static unsigned binary_status = 5; /* EMPTY; footer written only at plugin exit. */
 
 /* Access these flags only through GLib atomics, including under the lock. */
 static gint recording;
@@ -60,7 +66,32 @@ static void events_error(const char *operation)
 static void emit_event(const char *event, unsigned int cpu, bool has_cpu)
 {
     char cpu_field[16] = "NA";
-
+    unsigned kind = !strcmp(event,"BEGIN") ? 0 : !strcmp(event,"END") ? 1 :
+                    !strcmp(event,"LIMIT") ? 2 : !strcmp(event,"EXIT") ? 3 : 4;
+    if (event_id == UINT64_MAX || (binary_mode && has_cpu && cpu != 0)) {
+        fprintf(stderr,"memtrace: event counter/CPU invalid; capture incomplete\n");
+        output_failed = true;
+        binary_sink.failed = true;
+        g_atomic_int_set(&recording, false);
+        g_atomic_int_set(&exhausted, true);
+        return;
+    }
+    ++event_id;
+    if (binary_mode) {
+        binary_status = kind == 0 ? 4 : kind == 1 ? 0 : kind == 2 ? 1 : kind == 3 ? 2 : 3;
+        if (!binary_sink.failed && !binary_sink.writer.failed &&
+            (!binary_event(&binary_sink,event_id,interval_id,kind,has_cpu,sequence) ||
+             !binary_boundary(&binary_sink))) {
+            fprintf(stderr,"memtrace: binary event/flush failed; capture incomplete\n");
+            binary_sink.failed = true;
+            output_failed = true;
+            g_atomic_int_set(&recording, false);
+            g_atomic_int_set(&exhausted, true);
+            event = "ERROR";
+            binary_status = 3;
+        }
+    }
+    /* Binary boundary is flushed before its progress sidecar is visible. */
     if (!events_file || events_failed) {
         return;
     }
@@ -69,7 +100,7 @@ static void emit_event(const char *event, unsigned int cpu, bool has_cpu)
     }
     errno = 0;
     if (fprintf(events_file, "%" PRIu64 ",%" PRIu64 ",%s,%s,%" PRIu64 "\n",
-                ++event_id, interval_id, event, cpu_field, sequence) < 0 ||
+                event_id, interval_id, event, cpu_field, sequence) < 0 ||
         fflush(events_file) != 0) {
         events_error("write/flush");
         events_failed = true;
@@ -86,6 +117,7 @@ static void output_error(unsigned int cpu, bool has_cpu)
         return;
     }
     output_failed = true;
+    fprintf(stderr,"memtrace: recording permanently disabled; capture incomplete\n");
     g_atomic_int_set(&recording, false);
     g_atomic_int_set(&exhausted, true);
     emit_event("ERROR", cpu, has_cpu);
@@ -93,9 +125,10 @@ static void output_error(unsigned int cpu, bool has_cpu)
 
 static bool flush_outputs(unsigned int cpu, bool has_cpu)
 {
+    bool binary_ok = !binary_mode || binary_boundary(&binary_sink);
     bool memory_ok = writer_boundary(&memory_writer);
     bool walks_ok = writer_boundary(&walks_writer);
-    if (!memory_ok || !walks_ok || events_failed) {
+    if (!binary_ok || !memory_ok || !walks_ok || events_failed) {
         output_error(cpu, has_cpu);
         return false;
     }
@@ -118,12 +151,10 @@ static const char *walk_status(enum qemu_plugin_x86_walk_status status)
  * A fresh walk may differ from a stale TLB or concurrently edited tables;
  * retain the mismatch, never replace callback PA with reconstructed PA.
  */
-static void emit_walk(unsigned int cpu, uint64_t va, bool has_pa, uint64_t pa)
+static void emit_walk(unsigned int cpu, uint64_t va, bool has_pa, uint64_t pa,
+                      const struct qemu_plugin_x86_walk *snapshot, bool captured)
 {
-    struct qemu_plugin_x86_walk walk = {
-        .status = QEMU_PLUGIN_X86_WALK_UNAVAILABLE,
-    };
-    bool captured = qemu_plugin_x86_paging_walk(cpu, va, &walk);
+    struct qemu_plugin_x86_walk walk = *snapshot;
     bool ok = captured && walk.status == QEMU_PLUGIN_X86_WALK_OK;
     GString *row = g_string_new(NULL);
 
@@ -173,6 +204,37 @@ static void emit_walk(unsigned int cpu, uint64_t va, bool has_pa, uint64_t pa)
     g_string_free(row, true);
 }
 
+/* No CSV construction or per-access allocation in the production binary path. */
+static bool emit_binary_access(uint64_t pc, uint64_t va, bool has_pa, uint64_t pa,
+                               uint64_t size, bool store, bool io,
+                               const struct qemu_plugin_x86_walk *w, bool captured)
+{
+    TcAccess a = {0};
+    bool ok = captured && w->status == QEMU_PLUGIN_X86_WALK_OK;
+    a.memory.mask = has_pa ? 7 : 3;
+    a.memory.value[0]=pc; a.memory.value[1]=va; a.memory.value[2]=pa;
+    if(captured) {
+        a.context.mask=63;
+        a.context.value[0]=w->paging.cr3; a.context.value[1]=w->paging.root_pa;
+        a.context.value[2]=w->paging.cr0; a.context.value[3]=w->paging.cr4;
+        a.context.value[4]=w->paging.efer; a.context.value[5]=w->paging.phys_bits;
+    }
+    a.result.mask=(ok?3:0)|(has_pa?4:0);
+    a.result.value[0]=w->leaf_size; a.result.value[1]=w->pa; a.result.value[2]=pa;
+    a.size=size; a.operation=store; a.memory_type=!has_pa?2:io?1:0;
+    a.status=walk_status(w->status);
+    a.comparison=!ok||!has_pa?"not-comparable":w->pa==pa?"match":"mismatch";
+    a.status_size=strlen(a.status); a.comparison_size=strlen(a.comparison);
+    a.path_tag=w->n_entries?2:0; a.n_entries=w->n_entries;
+    if(w->n_entries>G_N_ELEMENTS(w->entries))return false;
+    for(unsigned i=0;i<w->n_entries;i++){
+        if(w->entries[i].level<1 || w->entries[i].level>5)return false;
+        a.entries[i].level=w->entries[i].level;
+        a.entries[i].address=w->entries[i].entry_pa; a.entries[i].value=w->entries[i].value;
+    }
+    return binary_access(&binary_sink,&a);
+}
+
 static void marker_begin(unsigned int cpu, void *userdata)
 {
     /* Any guest executing the bytes can toggle this global interval,
@@ -181,6 +243,11 @@ static void marker_begin(unsigned int cpu, void *userdata)
     g_mutex_lock(&trace_lock);
     if (!g_atomic_int_get(&recording) &&
         !g_atomic_int_get(&exhausted)) {
+        if (interval_id == UINT64_MAX || (binary_mode && cpu != 0)) {
+            output_error(cpu, true);
+            g_mutex_unlock(&trace_lock);
+            return;
+        }
         interval_id++;
         g_atomic_int_set(&recording, true);
         emit_event("BEGIN", cpu, true);
@@ -227,30 +294,45 @@ static void vcpu_mem(unsigned int cpu, qemu_plugin_meminfo_t info,
         return;
     }
 
-    /* This temporary handle must be queried here, never retained. */
+    if (binary_mode && cpu != 0) {
+        output_error(cpu, true);
+        g_mutex_unlock(&trace_lock);
+        return;
+    }
+    unsigned shift = qemu_plugin_mem_size_shift(info);
+    if (shift > 20 || sequence == UINT64_MAX) {
+        output_error(cpu, true);
+        g_mutex_unlock(&trace_lock);
+        return;
+    }
+    uint64_t size = UINT64_C(1) << shift;
+    bool store = qemu_plugin_mem_is_store(info);
+    bool io = false;
+    struct qemu_plugin_x86_walk walk = { .status = QEMU_PLUGIN_X86_WALK_UNAVAILABLE };
+    bool captured = false;
     hwaddr = qemu_plugin_get_hwaddr(info, vaddr);
     if (hwaddr) {
         callback_pa = qemu_plugin_hwaddr_phys_addr(hwaddr);
-        snprintf(pa, sizeof(pa), "0x%" PRIx64,
-                 callback_pa);
-        memory_type = qemu_plugin_hwaddr_is_io(hwaddr) ? "MMIO" : "RAM";
+        io = qemu_plugin_hwaddr_is_io(hwaddr);
+        memory_type = io ? "MMIO" : "RAM";
     }
-    snprintf(record, sizeof(record),
-             "%" PRIu64 ",%u,0x%" PRIx64 ",0x%" PRIx64
-             ",%s,%" PRIu64 ",%c,%s\n",
-             ++sequence, cpu, *pc, vaddr, pa,
-             UINT64_C(1) << qemu_plugin_mem_size_shift(info),
-             qemu_plugin_mem_is_store(info) ? 'W' : 'R', memory_type);
-    /* Keep allocation of numbers and whole-record output in one lock. */
-    if (memory_writer.file) {
-        if (!writer_write(&memory_writer, record, strlen(record))) {
-            output_error(cpu, true);
-        }
-    } else {
-        qemu_plugin_outs(record);
+    if (binary_mode || walks_writer.file) {
+        captured = qemu_plugin_x86_paging_walk(cpu, vaddr, &walk);
+        if (!captured) { walk.status = QEMU_PLUGIN_X86_WALK_UNAVAILABLE; walk.n_entries = 0; }
     }
-    if (walks_writer.file && !output_failed) {
-        emit_walk(cpu, vaddr, hwaddr != NULL, callback_pa);
+    ++sequence;
+    if (binary_mode && !emit_binary_access(*pc,vaddr,hwaddr!=NULL,callback_pa,size,store,io,&walk,captured)) {
+        fprintf(stderr,"memtrace: binary access serialization/write failed; capture incomplete\n");
+        output_error(cpu, true);
+    }
+    if ((!binary_mode || test_dual) && !output_failed) {
+        if (hwaddr)snprintf(pa,sizeof(pa),"0x%" PRIx64,callback_pa);
+        snprintf(record,sizeof(record),"%" PRIu64 ",%u,0x%" PRIx64 ",0x%" PRIx64
+                 ",%s,%" PRIu64 ",%c,%s\n", sequence,cpu,*pc,vaddr,pa,size,store?'W':'R',memory_type);
+        if (memory_writer.file) {
+            if (!writer_write(&memory_writer,record,strlen(record)))output_error(cpu,true);
+        } else { qemu_plugin_outs(record); }
+        if (walks_writer.file && !output_failed)emit_walk(cpu,vaddr,hwaddr!=NULL,callback_pa,&walk,captured);
     }
     if (output_failed) {
         g_mutex_unlock(&trace_lock);
@@ -273,7 +355,7 @@ static void vcpu_mem(unsigned int cpu, qemu_plugin_meminfo_t info,
          * and later BEGINs. The stderr diagnostic marks the capture incomplete.
          */
         g_atomic_int_set(&exhausted, true);
-        flush_outputs(cpu, true);
+        if (binary_mode) { output_error(cpu, true); } else { flush_outputs(cpu, true); }
         fprintf(stderr, "memtrace: access sequence counter exhausted at "
                 "UINT64_MAX; further recording disabled; capture incomplete\n");
     }
@@ -341,6 +423,51 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 static void plugin_exit(qemu_plugin_id_t id, void *userdata)
 {
     g_mutex_lock(&trace_lock);
+    if (binary_mode) {
+        if (g_atomic_int_get(&recording) && !output_failed) {
+            g_atomic_int_set(&recording,false);
+            if(flush_outputs(0,false))emit_event("EXIT",0,false);
+        }
+        bool m_ok=writer_close(&memory_writer), w_ok=writer_close(&walks_writer);
+        if(!m_ok || !w_ok || events_failed)output_error(0,false);
+        /* Keep a descriptor to our exclusively-created inode until close has
+         * succeeded. If finalization/close fails, remove the footer segment so
+         * a later reader cannot mistake this session for finalized. */
+        int guard=-1;
+        off_t checkpoint=-1;
+        bool finished=false;
+        if(!binary_sink.failed && !binary_sink.writer.failed && binary_boundary(&binary_sink)) {
+            guard=fcntl(fileno(binary_sink.writer.file),F_DUPFD_CLOEXEC,0);
+            if(guard>=0)checkpoint=lseek(guard,0,SEEK_END);
+            if(guard>=0 && checkpoint>=0)finished=binary_finish(&binary_sink,output_failed?3:binary_status);
+        }
+        bool closed=binary_close(&binary_sink);
+        if(!finished || !closed) {
+            if(guard>=0 && checkpoint>=0 && ftruncate(guard,checkpoint)) {
+                fprintf(stderr,"memtrace: binary footer rollback failed; capture incomplete\n");
+            }
+            fprintf(stderr,"memtrace: binary finalization/close failed; capture incomplete\n");
+            binary_sink.failed=true;
+            output_error(0,false);
+        }
+        binary_sink.failed=true; /* Session closed: no further embedded writes. */
+        if(events_file) {
+            FILE *f=events_file;events_file=NULL;
+            if(fclose(f)) {
+                events_error("close");events_failed=true;
+                if(guard>=0 && checkpoint>=0 && ftruncate(guard,checkpoint))
+                    fprintf(stderr,"memtrace: binary footer rollback failed; capture incomplete\n");
+                output_error(0,false);
+            }
+        }
+        if(guard>=0 && close(guard)) {
+            fprintf(stderr,"memtrace: binary guard close failed; capture incomplete\n");
+            binary_sink.failed=true;
+            output_error(0,false);
+        }
+        g_mutex_unlock(&trace_lock);
+        g_hash_table_destroy(pcs);g_mutex_clear(&trace_lock);return;
+    }
     bool was_active = g_atomic_int_get(&recording);
     flush_outputs(0, false);
     bool memory_ok = writer_close(&memory_writer);
@@ -373,12 +500,31 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     bool seen_limit = false;
     bool seen_roi = false;
     bool seen_compression = false;
-    bool seen_level = false;
+    bool seen_level = false, seen_format = false, seen_chunk = false, seen_dual = false;
 
     for (int i = 0; i < argc; i++) {
         const char *arg = argv[i];
         uint64_t value = 0;
 
+        if (g_str_has_prefix(arg,"format=")) {
+            if(seen_format || (strcmp(arg+7,"csv") && strcmp(arg+7,"inline-binary")))goto invalid;
+            seen_format=true;binary_mode=!strcmp(arg+7,"inline-binary");continue;
+        }
+        if (g_str_has_prefix(arg,"binary=")) {
+            if(binary_path || arg[7]!='/')goto invalid;
+            binary_path=arg+7;continue;
+        }
+        if (g_str_has_prefix(arg,"chunk-mib=")) {
+            const char *v=arg+10;
+            if(seen_chunk || !*v)goto invalid;
+            unsigned n=0;for(;*v;v++){if(*v<'0'||*v>'9'||n>16)goto invalid;n=n*10+*v-'0';}
+            if(n<1||n>16)goto invalid;
+            binary_chunk=n*1024*1024;seen_chunk=true;continue;
+        }
+        if (!strcmp(arg,"test-dual=on")) {
+            if(seen_dual)goto invalid;
+            test_dual=true;seen_dual=true;continue;
+        }
         if (g_str_has_prefix(arg, "memory=")) {
             if (memory_path || arg[7] != '/') {
                 goto invalid;
@@ -457,11 +603,25 @@ invalid:
                 "limit=unlimited or limit=N (unsigned decimal 0..%" PRIu64 ") or "
                 "roi=immediate|markers, events=PATH, memory=/ABSOLUTE/PATH, "
                 "walks=/ABSOLUTE/PATH, compression=none|xz, compression-level=0..9; "
-                "each option at most once\n",
+                "format=csv|inline-binary, binary=/ABSOLUTE/PATH, chunk-mib=1..16, test-dual=on; each option at most once\n",
                 arg, UINT64_MAX);
         return -1;
     }
 
+    if (binary_mode) {
+        if (!info->system_emulation || strcmp(info->target_name,"x86_64") ||
+            info->system.smp_vcpus!=1 || info->system.max_vcpus!=1 ||
+            !marker_mode || !binary_path || !events_path ||
+            (seen_compression && !compression_xz) ||
+            (!test_dual && (memory_path || walks_path)) ||
+            (test_dual && (!memory_path || !walks_path))) {
+            fprintf(stderr,"memtrace: inline-binary requires full-system x86_64 TCG, CPU0 only (-smp 1,maxcpus=1), roi=markers, binary=/ABSOLUTE/PATH, events=PATH, compression=xz; CSV paths only with test-dual=on\n");
+            return -1;
+        }
+        compression_xz=true;
+    } else if(binary_path || seen_chunk || test_dual) {
+        fprintf(stderr,"memtrace: binary/chunk/test-dual options require format=inline-binary\n");return -1;
+    }
     if (marker_mode && strcmp(info->target_name, "x86_64") != 0) {
         fprintf(stderr, "memtrace: roi=markers requires an x86_64 guest "
                 "(got %s)\n", info->target_name);
@@ -477,7 +637,7 @@ invalid:
         return -1;
     }
 
-    if ((compression_xz && !memory_path) || (seen_level && !compression_xz)) {
+    if ((!binary_mode && compression_xz && !memory_path) || (seen_level && !compression_xz)) {
         fprintf(stderr, "memtrace: xz requires memory=/ABSOLUTE/PATH; "
                 "compression-level requires compression=xz\n");
         return -1;
@@ -499,6 +659,9 @@ invalid:
             events_error("header write/flush");
             goto install_failed;
         }
+    }
+    if (binary_mode && !binary_open(&binary_sink,binary_path,binary_chunk,compression_level)) {
+        goto install_failed;
     }
     if (memory_path) {
         if (!writer_open(&memory_writer, "memory", memory_path,
@@ -525,7 +688,7 @@ invalid:
             !writer_boundary(&memory_writer)) {
             goto install_failed;
         }
-    } else {
+    } else if (!binary_mode) {
         qemu_plugin_outs(header);
     }
 
@@ -539,6 +702,7 @@ invalid:
     return 0;
 
 install_failed:
+    if(binary_mode)binary_close(&binary_sink);
     writer_close(&walks_writer);
     writer_close(&memory_writer);
     if (events_file) {

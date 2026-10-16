@@ -47,7 +47,7 @@ PLUGIN_CFLAGS += -I$(TOP_SRC_PATH)/include/qemu
 all: $(SONAMES)
 
 # Only memtrace needs liblzma; do not change linkage for other examples.
-memtrace.o: $(SRC_PATH)/memtrace.c $(SRC_PATH)/memtrace-writer.h
+memtrace.o: $(SRC_PATH)/memtrace.c $(SRC_PATH)/memtrace-writer.h $(SRC_PATH)/memtrace-binary.h $(SRC_PATH)/../../../traces/trace-codec/wire.h
 	@$(PKG_CONFIG) --exists liblzma || { echo "memtrace requires liblzma development headers/library" >&2; exit 1; }
 	$(CC) $(CFLAGS) $(PLUGIN_CFLAGS) -c -o $@ $<
 memtrace.o: PLUGIN_CFLAGS += $(shell $(PKG_CONFIG) --cflags liblzma)
