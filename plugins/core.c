@@ -474,6 +474,21 @@ void qemu_plugin_vcpu_mem_cb(CPUState *cpu, uint64_t vaddr,
     }
 }
 
+QEMU_DISABLE_CFI
+void qemu_plugin_x86_context(CPUState *cpu,
+    enum qemu_plugin_x86_context_kind kind, uint64_t operand,
+    const struct qemu_plugin_x86_paging *after)
+{
+    struct qemu_plugin_cb *cb, *next;
+    if (!test_bit(QEMU_PLUGIN_EV_X86_CONTEXT, cpu->plugin_mask)) {
+        return;
+    }
+    QLIST_FOREACH_SAFE_RCU(cb, &plugin.cb_lists[QEMU_PLUGIN_EV_X86_CONTEXT],
+                          entry, next) {
+        cb->f.x86_context(cpu->cpu_index, kind, operand, after);
+    }
+}
+
 void qemu_plugin_atexit_cb(void)
 {
     plugin_cb__udata(QEMU_PLUGIN_EV_ATEXIT);

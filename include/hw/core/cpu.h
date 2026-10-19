@@ -32,6 +32,7 @@
 #include "qemu/queue.h"
 #include "qemu/thread.h"
 #include "qemu/plugin-event.h"
+#include "qemu/qemu-plugin.h"
 #include "qom/object.h"
 
 typedef int (*WriteCoreDumpFunction)(const void *buf, size_t size,
@@ -536,6 +537,8 @@ struct CPUState {
 
 #ifdef CONFIG_PLUGIN
     GArray *plugin_mem_cbs;
+    /* Last completed slow-path operation, copied by value before callbacks. */
+    struct qemu_plugin_mem_access plugin_mem_access;
 #endif
 
     /* TODO Move common fields from CPUArchState here. */

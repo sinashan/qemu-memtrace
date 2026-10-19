@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qapi/qapi-events-run-state.h"
 #include "cpu.h"
+#include "plugin-context.h"
 #include "exec/exec-all.h"
 #include "sysemu/runstate.h"
 #ifndef CONFIG_USER_ONLY
@@ -161,6 +162,7 @@ void cpu_x86_update_cr0(CPUX86State *env, uint32_t new_cr0)
     /* update FPU flags */
     env->hflags = (env->hflags & ~(HF_MP_MASK | HF_EM_MASK | HF_TS_MASK)) |
         ((new_cr0 << (HF_MP_SHIFT - 1)) & (HF_MP_MASK | HF_EM_MASK | HF_TS_MASK));
+    x86_plugin_context(env, QEMU_PLUGIN_X86_CONTEXT_CR0, new_cr0);
 }
 
 /* XXX: in legacy PAE mode, generate a GPF if reserved bits are set in
@@ -173,6 +175,7 @@ void cpu_x86_update_cr3(CPUX86State *env, target_ulong new_cr3)
                         "CR3 update: CR3=" TARGET_FMT_lx "\n", new_cr3);
         tlb_flush(env_cpu(env));
     }
+    x86_plugin_context(env, QEMU_PLUGIN_X86_CONTEXT_CR3, new_cr3);
 }
 
 void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
@@ -224,6 +227,7 @@ void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
 
     cpu_sync_bndcs_hflags(env);
     cpu_sync_avx_hflag(env);
+    x86_plugin_context(env, QEMU_PLUGIN_X86_CONTEXT_CR4, new_cr4);
 }
 
 #if !defined(CONFIG_USER_ONLY)
@@ -621,6 +625,7 @@ void cpu_load_efer(CPUX86State *env, uint64_t val)
     if (env->efer & MSR_EFER_SVME) {
         env->hflags |= HF_SVME_MASK;
     }
+    x86_plugin_context(env, QEMU_PLUGIN_X86_CONTEXT_EFER, val);
 }
 
 uint8_t x86_ldub_phys(CPUState *cs, hwaddr addr)

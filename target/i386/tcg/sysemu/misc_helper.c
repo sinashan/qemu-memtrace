@@ -25,6 +25,7 @@
 #include "exec/address-spaces.h"
 #include "exec/exec-all.h"
 #include "tcg/helper-tcg.h"
+#include "target/i386/plugin-context.h"
 
 void helper_outb(CPUX86State *env, uint32_t port, uint32_t data)
 {
@@ -477,6 +478,7 @@ void helper_rdmsr(CPUX86State *env)
 void helper_flush_page(CPUX86State *env, target_ulong addr)
 {
     tlb_flush_page(env_cpu(env), addr);
+    x86_plugin_context(env, QEMU_PLUGIN_X86_CONTEXT_INVLPG, addr);
 }
 
 static G_NORETURN

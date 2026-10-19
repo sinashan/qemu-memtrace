@@ -12,6 +12,10 @@
 #include "exec/cpu-defs.h"
 #include "exec/hwaddr.h"
 
+#ifdef CONFIG_PLUGIN
+extern bool qemu_plugin_mem_segments_requested;
+#endif
+
 struct qemu_plugin_hwaddr {
     bool is_io;
     bool is_store;

@@ -60,6 +60,7 @@ union qemu_plugin_cb_sig {
     qemu_plugin_vcpu_udata_cb_t      vcpu_udata;
     qemu_plugin_vcpu_tb_trans_cb_t   vcpu_tb_trans;
     qemu_plugin_vcpu_mem_cb_t        vcpu_mem;
+    qemu_plugin_x86_context_cb_t     x86_context;
     qemu_plugin_vcpu_syscall_cb_t    vcpu_syscall;
     qemu_plugin_vcpu_syscall_ret_cb_t vcpu_syscall_ret;
     void *generic;
@@ -199,6 +200,10 @@ void qemu_plugin_vcpu_syscall_ret(CPUState *cpu, int64_t num, int64_t ret);
 void qemu_plugin_vcpu_mem_cb(CPUState *cpu, uint64_t vaddr,
                              MemOpIdx oi, enum qemu_plugin_mem_rw rw);
 
+void qemu_plugin_x86_context(CPUState *cpu,
+    enum qemu_plugin_x86_context_kind kind, uint64_t operand,
+    const struct qemu_plugin_x86_paging *after);
+
 void qemu_plugin_flush_cb(void);
 
 void qemu_plugin_atexit_cb(void);
@@ -308,5 +313,11 @@ static inline void qemu_plugin_user_postfork(bool is_child)
 { }
 
 #endif /* !CONFIG_PLUGIN */
+
+#ifndef CONFIG_PLUGIN
+static inline void qemu_plugin_x86_context(CPUState *cpu,
+    enum qemu_plugin_x86_context_kind kind, uint64_t operand,
+    const struct qemu_plugin_x86_paging *after) { }
+#endif
 
 #endif /* QEMU_PLUGIN_H */

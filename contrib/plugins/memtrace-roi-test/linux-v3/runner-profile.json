@@ -1,0 +1,7 @@
+{
+  "linux-v3": {
+    "guest_dir": "/home/ubuntu",
+    "argv": ["/home/ubuntu/memtrace-linux-v3"],
+    "env": {}
+  }
+}

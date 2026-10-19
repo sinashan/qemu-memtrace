@@ -1682,6 +1682,50 @@ typedef struct MMULookupLocals {
     int mmu_idx;
 } MMULookupLocals;
 
+/* Snapshot execution translations while CPUTLBEntryFull pointers are valid.
+ * Private to each helper invocation: reentrant device operations cannot replace
+ * an outer access's evidence. Only its successful return publishes this copy.
+ * A fault/retry longjmp cannot publish a successful operation.
+ */
+static void plugin_mmu_snapshot(CPUState *cpu, vaddr addr, MemOpIdx oi,
+                                MMUAccessType type, MMULookupLocals *l,
+                                struct qemu_plugin_mem_access *out)
+{
+#ifdef CONFIG_PLUGIN
+    if (type == MMU_INST_FETCH ||
+        !qatomic_read(&qemu_plugin_mem_segments_requested)) {
+        return;
+    }
+    uint64_t size = memop_size(get_memop(oi));
+    if (addr > UINT64_MAX - (size - 1)) {
+        return;
+    }
+    out->va = addr;
+    out->size = size;
+    out->info = make_plugin_meminfo(oi, type == MMU_DATA_STORE ?
+                                   QEMU_PLUGIN_MEM_W : QEMU_PLUGIN_MEM_R);
+    out->count = l->page[1].size ? 2 : 1;
+    for (unsigned i = 0; i < out->count; i++) {
+        MMULookupPageData *p = &l->page[i];
+        out->segments[i] = (struct qemu_plugin_mem_segment) {
+            .offset = p->addr - addr, .size = p->size, .va = p->addr,
+            .pa = p->full->phys_addr | (p->addr & ~TARGET_PAGE_MASK),
+            .is_io = (p->flags & TLB_MMIO) != 0,
+        };
+    }
+#endif
+}
+
+static void plugin_mmu_publish(CPUState *cpu,
+                                const struct qemu_plugin_mem_access *result)
+{
+#ifdef CONFIG_PLUGIN
+    if (qatomic_read(&qemu_plugin_mem_segments_requested)) {
+        cpu->plugin_mem_access = *result;
+    }
+#endif
+}
+
 /**
  * mmu_lookup1: translate one page
  * @cpu: generic cpu state
@@ -1858,6 +1902,11 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     void *hostaddr;
     CPUTLBEntryFull *full;
 
+#ifdef CONFIG_PLUGIN
+    /* Atomic slow paths use a separate lookup; never reuse an older ordinary
+     * crossing's evidence after an atomic retry/stop-the-world transition. */
+    cpu->plugin_mem_access.count = 0;
+#endif
     tcg_debug_assert(mmu_idx < NB_MMU_MODES);
 
     /* Adjust the given return address.  */
@@ -2367,21 +2416,33 @@ static uint64_t do_ld_8(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
     return ret;
 }
 
-static uint8_t do_ld1_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
-                          uintptr_t ra, MMUAccessType access_type)
+static uint8_t do_ld1_mmu_observed(CPUState *cpu, vaddr addr, MemOpIdx oi,
+                          uintptr_t ra, MMUAccessType access_type,
+                              struct qemu_plugin_mem_access *observed)
 {
     MMULookupLocals l;
     bool crosspage;
 
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
+    plugin_mmu_snapshot(cpu, addr, oi, access_type, &l, observed);
     tcg_debug_assert(!crosspage);
 
     return do_ld_1(cpu, &l.page[0], l.mmu_idx, access_type, ra);
 }
 
-static uint16_t do_ld2_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
-                           uintptr_t ra, MMUAccessType access_type)
+static uint8_t do_ld1_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
+                          uintptr_t ra, MMUAccessType access_type)
+{
+    struct qemu_plugin_mem_access observed = { 0 };
+    uint8_t result = do_ld1_mmu_observed(cpu, addr, oi, ra, access_type, &observed);
+    plugin_mmu_publish(cpu, &observed);
+    return result;
+}
+
+static uint16_t do_ld2_mmu_observed(CPUState *cpu, vaddr addr, MemOpIdx oi,
+                           uintptr_t ra, MMUAccessType access_type,
+                              struct qemu_plugin_mem_access *observed)
 {
     MMULookupLocals l;
     bool crosspage;
@@ -2390,6 +2451,7 @@ static uint16_t do_ld2_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
+    plugin_mmu_snapshot(cpu, addr, oi, access_type, &l, observed);
     if (likely(!crosspage)) {
         return do_ld_2(cpu, &l.page[0], l.mmu_idx, access_type, l.memop, ra);
     }
@@ -2405,8 +2467,18 @@ static uint16_t do_ld2_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
     return ret;
 }
 
-static uint32_t do_ld4_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
+static uint16_t do_ld2_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
                            uintptr_t ra, MMUAccessType access_type)
+{
+    struct qemu_plugin_mem_access observed = { 0 };
+    uint16_t result = do_ld2_mmu_observed(cpu, addr, oi, ra, access_type, &observed);
+    plugin_mmu_publish(cpu, &observed);
+    return result;
+}
+
+static uint32_t do_ld4_mmu_observed(CPUState *cpu, vaddr addr, MemOpIdx oi,
+                           uintptr_t ra, MMUAccessType access_type,
+                              struct qemu_plugin_mem_access *observed)
 {
     MMULookupLocals l;
     bool crosspage;
@@ -2414,6 +2486,7 @@ static uint32_t do_ld4_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
+    plugin_mmu_snapshot(cpu, addr, oi, access_type, &l, observed);
     if (likely(!crosspage)) {
         return do_ld_4(cpu, &l.page[0], l.mmu_idx, access_type, l.memop, ra);
     }
@@ -2426,8 +2499,18 @@ static uint32_t do_ld4_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
     return ret;
 }
 
-static uint64_t do_ld8_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
+static uint32_t do_ld4_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
                            uintptr_t ra, MMUAccessType access_type)
+{
+    struct qemu_plugin_mem_access observed = { 0 };
+    uint32_t result = do_ld4_mmu_observed(cpu, addr, oi, ra, access_type, &observed);
+    plugin_mmu_publish(cpu, &observed);
+    return result;
+}
+
+static uint64_t do_ld8_mmu_observed(CPUState *cpu, vaddr addr, MemOpIdx oi,
+                           uintptr_t ra, MMUAccessType access_type,
+                              struct qemu_plugin_mem_access *observed)
 {
     MMULookupLocals l;
     bool crosspage;
@@ -2435,6 +2518,7 @@ static uint64_t do_ld8_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
 
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
+    plugin_mmu_snapshot(cpu, addr, oi, access_type, &l, observed);
     if (likely(!crosspage)) {
         return do_ld_8(cpu, &l.page[0], l.mmu_idx, access_type, l.memop, ra);
     }
@@ -2447,8 +2531,18 @@ static uint64_t do_ld8_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
     return ret;
 }
 
-static Int128 do_ld16_mmu(CPUState *cpu, vaddr addr,
-                          MemOpIdx oi, uintptr_t ra)
+static uint64_t do_ld8_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
+                           uintptr_t ra, MMUAccessType access_type)
+{
+    struct qemu_plugin_mem_access observed = { 0 };
+    uint64_t result = do_ld8_mmu_observed(cpu, addr, oi, ra, access_type, &observed);
+    plugin_mmu_publish(cpu, &observed);
+    return result;
+}
+
+static Int128 do_ld16_mmu_observed(CPUState *cpu, vaddr addr,
+                          MemOpIdx oi, uintptr_t ra,
+                              struct qemu_plugin_mem_access *observed)
 {
     MMULookupLocals l;
     bool crosspage;
@@ -2458,6 +2552,7 @@ static Int128 do_ld16_mmu(CPUState *cpu, vaddr addr,
 
     cpu_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_LOAD, &l);
+    plugin_mmu_snapshot(cpu, addr, oi, MMU_DATA_LOAD, &l, observed);
     if (likely(!crosspage)) {
         if (unlikely(l.page[0].flags & TLB_MMIO)) {
             ret = do_ld16_mmio_beN(cpu, l.page[0].full, 0, addr, 16,
@@ -2506,6 +2601,15 @@ static Int128 do_ld16_mmu(CPUState *cpu, vaddr addr,
         ret = bswap128(ret);
     }
     return ret;
+}
+
+static Int128 do_ld16_mmu(CPUState *cpu, vaddr addr,
+                          MemOpIdx oi, uintptr_t ra)
+{
+    struct qemu_plugin_mem_access observed = { 0 };
+    Int128 result = do_ld16_mmu_observed(cpu, addr, oi, ra, &observed);
+    plugin_mmu_publish(cpu, &observed);
+    return result;
 }
 
 /*
@@ -2786,21 +2890,32 @@ static void do_st_8(CPUState *cpu, MMULookupPageData *p, uint64_t val,
     }
 }
 
-static void do_st1_mmu(CPUState *cpu, vaddr addr, uint8_t val,
-                       MemOpIdx oi, uintptr_t ra)
+static void do_st1_mmu_observed(CPUState *cpu, vaddr addr, uint8_t val,
+                       MemOpIdx oi, uintptr_t ra,
+                              struct qemu_plugin_mem_access *observed)
 {
     MMULookupLocals l;
     bool crosspage;
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
+    plugin_mmu_snapshot(cpu, addr, oi, MMU_DATA_STORE, &l, observed);
     tcg_debug_assert(!crosspage);
 
     do_st_1(cpu, &l.page[0], val, l.mmu_idx, ra);
 }
 
-static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
+static void do_st1_mmu(CPUState *cpu, vaddr addr, uint8_t val,
                        MemOpIdx oi, uintptr_t ra)
+{
+    struct qemu_plugin_mem_access observed = { 0 };
+    do_st1_mmu_observed(cpu, addr, val, oi, ra, &observed);
+    plugin_mmu_publish(cpu, &observed);
+}
+
+static void do_st2_mmu_observed(CPUState *cpu, vaddr addr, uint16_t val,
+                       MemOpIdx oi, uintptr_t ra,
+                              struct qemu_plugin_mem_access *observed)
 {
     MMULookupLocals l;
     bool crosspage;
@@ -2808,6 +2923,7 @@ static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
+    plugin_mmu_snapshot(cpu, addr, oi, MMU_DATA_STORE, &l, observed);
     if (likely(!crosspage)) {
         do_st_2(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
         return;
@@ -2822,14 +2938,24 @@ static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
     do_st_1(cpu, &l.page[1], b, l.mmu_idx, ra);
 }
 
-static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
+static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
                        MemOpIdx oi, uintptr_t ra)
+{
+    struct qemu_plugin_mem_access observed = { 0 };
+    do_st2_mmu_observed(cpu, addr, val, oi, ra, &observed);
+    plugin_mmu_publish(cpu, &observed);
+}
+
+static void do_st4_mmu_observed(CPUState *cpu, vaddr addr, uint32_t val,
+                       MemOpIdx oi, uintptr_t ra,
+                              struct qemu_plugin_mem_access *observed)
 {
     MMULookupLocals l;
     bool crosspage;
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
+    plugin_mmu_snapshot(cpu, addr, oi, MMU_DATA_STORE, &l, observed);
     if (likely(!crosspage)) {
         do_st_4(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
         return;
@@ -2843,14 +2969,24 @@ static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
     (void) do_st_leN(cpu, &l.page[1], val, l.mmu_idx, l.memop, ra);
 }
 
-static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
+static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
                        MemOpIdx oi, uintptr_t ra)
+{
+    struct qemu_plugin_mem_access observed = { 0 };
+    do_st4_mmu_observed(cpu, addr, val, oi, ra, &observed);
+    plugin_mmu_publish(cpu, &observed);
+}
+
+static void do_st8_mmu_observed(CPUState *cpu, vaddr addr, uint64_t val,
+                       MemOpIdx oi, uintptr_t ra,
+                              struct qemu_plugin_mem_access *observed)
 {
     MMULookupLocals l;
     bool crosspage;
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
+    plugin_mmu_snapshot(cpu, addr, oi, MMU_DATA_STORE, &l, observed);
     if (likely(!crosspage)) {
         do_st_8(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
         return;
@@ -2864,8 +3000,17 @@ static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
     (void) do_st_leN(cpu, &l.page[1], val, l.mmu_idx, l.memop, ra);
 }
 
-static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
-                        MemOpIdx oi, uintptr_t ra)
+static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
+                       MemOpIdx oi, uintptr_t ra)
+{
+    struct qemu_plugin_mem_access observed = { 0 };
+    do_st8_mmu_observed(cpu, addr, val, oi, ra, &observed);
+    plugin_mmu_publish(cpu, &observed);
+}
+
+static void do_st16_mmu_observed(CPUState *cpu, vaddr addr, Int128 val,
+                        MemOpIdx oi, uintptr_t ra,
+                              struct qemu_plugin_mem_access *observed)
 {
     MMULookupLocals l;
     bool crosspage;
@@ -2874,6 +3019,7 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
 
     cpu_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
+    plugin_mmu_snapshot(cpu, addr, oi, MMU_DATA_STORE, &l, observed);
     if (likely(!crosspage)) {
         if (unlikely(l.page[0].flags & TLB_MMIO)) {
             if ((l.memop & MO_BSWAP) != MO_LE) {
@@ -2920,6 +3066,14 @@ static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
         b = do_st16_leN(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
         do_st_leN(cpu, &l.page[1], b, l.mmu_idx, l.memop, ra);
     }
+}
+
+static void do_st16_mmu(CPUState *cpu, vaddr addr, Int128 val,
+                        MemOpIdx oi, uintptr_t ra)
+{
+    struct qemu_plugin_mem_access observed = { 0 };
+    do_st16_mmu_observed(cpu, addr, val, oi, ra, &observed);
+    plugin_mmu_publish(cpu, &observed);
 }
 
 #include "ldst_common.c.inc"

@@ -38,7 +38,7 @@ static bool compression_xz;
 static unsigned int compression_level = 3;
 static bool output_failed;
 static const char *walks_path;
-static bool binary_mode, test_dual;
+static bool binary_mode, test_dual, execution_mode;
 static const char *binary_path;
 static size_t binary_chunk = 4 * 1024 * 1024;
 static TraceBinary binary_sink;
@@ -205,7 +205,7 @@ static void emit_walk(unsigned int cpu, uint64_t va, bool has_pa, uint64_t pa,
 }
 
 /* No CSV construction or per-access allocation in the production binary path. */
-static bool emit_binary_access(uint64_t pc, uint64_t va, bool has_pa, uint64_t pa,
+static bool make_binary_access(TcAccess *result, uint64_t pc, uint64_t va, bool has_pa, uint64_t pa,
                                uint64_t size, bool store, bool io,
                                const struct qemu_plugin_x86_walk *w, bool captured)
 {
@@ -232,7 +232,61 @@ static bool emit_binary_access(uint64_t pc, uint64_t va, bool has_pa, uint64_t p
         a.entries[i].level=w->entries[i].level;
         a.entries[i].address=w->entries[i].entry_pa; a.entries[i].value=w->entries[i].value;
     }
-    return binary_access(&binary_sink,&a);
+    *result = a;
+    return true;
+}
+
+static bool emit_binary_access(uint64_t pc, uint64_t va, bool has_pa, uint64_t pa,
+                               uint64_t size, bool store, bool io,
+                               const struct qemu_plugin_x86_walk *w, bool captured)
+{
+    TcAccess a;
+    return make_binary_access(&a,pc,va,has_pa,pa,size,store,io,w,captured) &&
+           binary_access(&binary_sink,&a);
+}
+
+static TcCells paging_cells(const struct qemu_plugin_x86_paging *p)
+{
+    TcCells c = { .mask = 63, .value = {
+        p->cr3,p->root_pa,p->cr0,p->cr4,p->efer,p->phys_bits } };
+    return c;
+}
+
+static void context_change(unsigned int cpu,
+    enum qemu_plugin_x86_context_kind kind, uint64_t operand,
+    const struct qemu_plugin_x86_paging *after)
+{
+    if (!g_atomic_int_get(&recording) || g_atomic_int_get(&exhausted)) return;
+    g_mutex_lock(&trace_lock);
+    if (g_atomic_int_get(&recording) && !g_atomic_int_get(&exhausted)) {
+        TcCells state = paging_cells(after);
+        if (cpu != 0 || !binary_context(&binary_sink,kind,operand,&state))
+            output_error(cpu,true);
+    }
+    g_mutex_unlock(&trace_lock);
+}
+
+static bool emit_execution_group(unsigned int cpu, qemu_plugin_meminfo_t info,
+                                  uint64_t pc, uint64_t va)
+{
+    struct qemu_plugin_mem_access observed;
+    TcAccess segments[2];
+    if (!qemu_plugin_get_mem_segments(cpu,info,va,&observed)) {
+        fprintf(stderr,"memtrace: execution segment evidence unavailable cpu=%u pc=0x%" PRIx64
+                " va=0x%" PRIx64 " size=%" PRIu64
+                " (supported callback sizes 1..16); no translation guessed; capture incomplete\n",
+                cpu,pc,va,UINT64_C(1)<<qemu_plugin_mem_size_shift(info));
+        return false;
+    }
+    for (unsigned i=0;i<observed.count;i++) {
+        const struct qemu_plugin_mem_segment *seg=&observed.segments[i];
+        struct qemu_plugin_x86_walk w = { .status=QEMU_PLUGIN_X86_WALK_UNAVAILABLE };
+        bool captured=qemu_plugin_x86_paging_walk(cpu,seg->va,&w);
+        if(!captured){w.status=QEMU_PLUGIN_X86_WALK_UNAVAILABLE;w.n_entries=0;}
+        if (!make_binary_access(&segments[i],pc,seg->va,true,seg->pa,seg->size,
+                                qemu_plugin_mem_is_store(info),seg->is_io,&w,captured))return false;
+    }
+    return binary_group(&binary_sink,observed.size,observed.count,segments);
 }
 
 static void marker_begin(unsigned int cpu, void *userdata)
@@ -251,6 +305,13 @@ static void marker_begin(unsigned int cpu, void *userdata)
         interval_id++;
         g_atomic_int_set(&recording, true);
         emit_event("BEGIN", cpu, true);
+        if (execution_mode && !output_failed) {
+            struct qemu_plugin_x86_walk initial = {0};
+            bool captured=qemu_plugin_x86_paging_walk(cpu,0,&initial);
+            TcCells state=paging_cells(&initial.paging);
+            if (!captured || !binary_context(&binary_sink,0,0,&state))
+                output_error(cpu,true);
+        }
         if (events_failed) {
             output_error(cpu, true);
         }
@@ -310,18 +371,19 @@ static void vcpu_mem(unsigned int cpu, qemu_plugin_meminfo_t info,
     bool io = false;
     struct qemu_plugin_x86_walk walk = { .status = QEMU_PLUGIN_X86_WALK_UNAVAILABLE };
     bool captured = false;
-    hwaddr = qemu_plugin_get_hwaddr(info, vaddr);
+    hwaddr = execution_mode ? NULL : qemu_plugin_get_hwaddr(info, vaddr);
     if (hwaddr) {
         callback_pa = qemu_plugin_hwaddr_phys_addr(hwaddr);
         io = qemu_plugin_hwaddr_is_io(hwaddr);
         memory_type = io ? "MMIO" : "RAM";
     }
-    if (binary_mode || walks_writer.file) {
+    if ((!execution_mode && binary_mode) || walks_writer.file) {
         captured = qemu_plugin_x86_paging_walk(cpu, vaddr, &walk);
         if (!captured) { walk.status = QEMU_PLUGIN_X86_WALK_UNAVAILABLE; walk.n_entries = 0; }
     }
     ++sequence;
-    if (binary_mode && !emit_binary_access(*pc,vaddr,hwaddr!=NULL,callback_pa,size,store,io,&walk,captured)) {
+    if (binary_mode && !(execution_mode ? emit_execution_group(cpu,info,*pc,vaddr) :
+        emit_binary_access(*pc,vaddr,hwaddr!=NULL,callback_pa,size,store,io,&walk,captured))) {
         fprintf(stderr,"memtrace: binary access serialization/write failed; capture incomplete\n");
         output_error(cpu, true);
     }
@@ -507,8 +569,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         uint64_t value = 0;
 
         if (g_str_has_prefix(arg,"format=")) {
-            if(seen_format || (strcmp(arg+7,"csv") && strcmp(arg+7,"inline-binary")))goto invalid;
-            seen_format=true;binary_mode=!strcmp(arg+7,"inline-binary");continue;
+            if(seen_format || (strcmp(arg+7,"csv") && strcmp(arg+7,"inline-binary") && strcmp(arg+7,"execution-binary")))goto invalid;
+            seen_format=true;execution_mode=!strcmp(arg+7,"execution-binary");binary_mode=execution_mode||!strcmp(arg+7,"inline-binary");continue;
         }
         if (g_str_has_prefix(arg,"binary=")) {
             if(binary_path || arg[7]!='/')goto invalid;
@@ -603,11 +665,15 @@ invalid:
                 "limit=unlimited or limit=N (unsigned decimal 0..%" PRIu64 ") or "
                 "roi=immediate|markers, events=PATH, memory=/ABSOLUTE/PATH, "
                 "walks=/ABSOLUTE/PATH, compression=none|xz, compression-level=0..9; "
-                "format=csv|inline-binary, binary=/ABSOLUTE/PATH, chunk-mib=1..16, test-dual=on; each option at most once\n",
+                "format=csv|inline-binary|execution-binary, binary=/ABSOLUTE/PATH, chunk-mib=1..16, test-dual=on; each option at most once\n",
                 arg, UINT64_MAX);
         return -1;
     }
 
+    if (execution_mode && test_dual) {
+        fprintf(stderr,"memtrace: execution-binary cannot export legacy test-dual CSV (segments/events would be lost)\n");
+        return -1;
+    }
     if (binary_mode) {
         if (!info->system_emulation || strcmp(info->target_name,"x86_64") ||
             info->system.smp_vcpus!=1 || info->system.max_vcpus!=1 ||
@@ -660,7 +726,7 @@ invalid:
             goto install_failed;
         }
     }
-    if (binary_mode && !binary_open(&binary_sink,binary_path,binary_chunk,compression_level)) {
+    if (binary_mode && !binary_open_version(&binary_sink,binary_path,binary_chunk,compression_level,execution_mode)) {
         goto install_failed;
     }
     if (memory_path) {
@@ -697,6 +763,10 @@ invalid:
     g_atomic_int_set(&recording, !marker_mode && (unlimited || limit != 0));
     g_atomic_int_set(&exhausted, !unlimited && limit == 0);
 
+    if (execution_mode) {
+        qemu_plugin_request_mem_segments();
+        qemu_plugin_register_x86_context_cb(id,context_change);
+    }
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
     return 0;

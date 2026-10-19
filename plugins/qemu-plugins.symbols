@@ -43,4 +43,7 @@
   qemu_plugin_uninstall;
   qemu_plugin_vcpu_for_each;
   qemu_plugin_x86_paging_walk;
+  qemu_plugin_request_mem_segments;
+  qemu_plugin_get_mem_segments;
+  qemu_plugin_register_x86_context_cb;
 };

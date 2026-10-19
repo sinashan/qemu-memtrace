@@ -168,3 +168,13 @@ See [compression.md](compression.md) for `compression=xz,compression-level=3,`
 concatenated-stream boundary framing, bounded buffers, terminal ERROR semantics,
 fresh-file protection, launch/runner options and local compression checks.
 Without `memory=`, raw memory output remains through QEMU logging.
+
+`execution/` contains a small **diskless full-system** multiboot regression for
+the opt-in `format=execution-binary` extension: observed cross-page segments and
+committed architectural context events. See
+[execution/README.md](execution/README.md) before running it. Existing Linux ROI,
+first-touch and footprint workloads are unchanged.
+
+`linux-v3/` adds a static Linux cross-page SSE and shared-memfd remapping
+workload, a bounded shared-decoder verifier, and user-run v3 capture commands.
+See [linux-v3/README.md](linux-v3/README.md); its local tests do not launch a VM.

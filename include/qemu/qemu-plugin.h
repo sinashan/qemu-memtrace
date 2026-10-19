@@ -658,7 +658,8 @@ void qemu_plugin_outs(const char *string);
 
 /*
  * EXPERIMENTAL local extension, not an upstream QEMU 8.2 API/ABI promise.
- * Only call from a full-system x86-64 TCG memory callback, with that callback's
+ * Only call from a full-system x86-64 TCG memory or instruction callback,
+ * with that callback's
  * vCPU index. Copies current guest state and observational RAM-only entries.
  * No faults, A/D updates, TLB fills, or device reads. This is a fresh walk
  * after the access, not a permission/fault validator or cached-translation
@@ -698,6 +699,57 @@ struct qemu_plugin_x86_walk {
     struct qemu_plugin_x86_pte entries[4];
     uint64_t leaf_size, pa;         /* valid only for WALK_OK */
 };
+
+/* Experimental architectural context notifications. Emitted AFTER state is
+ * committed, including same-value CR3 reloads. These are NOT notifications of
+ * every internal QEMU TLB flush. Scope policy for this extension is explicitly
+ * conservative: flush ALL modeled entries, including global entries; PCID
+ * exact retention is not implemented. INVPCID is not implemented by this
+ * checkout's TCG instruction translator. Consumers must reject PCIDE mode.
+ * Updates from task switches/SMM also report committed context transitions.
+ */
+enum qemu_plugin_x86_context_kind {
+    QEMU_PLUGIN_X86_CONTEXT_SNAPSHOT,
+    QEMU_PLUGIN_X86_CONTEXT_INVLPG,
+    QEMU_PLUGIN_X86_CONTEXT_CR0,
+    QEMU_PLUGIN_X86_CONTEXT_CR3,
+    QEMU_PLUGIN_X86_CONTEXT_CR4,
+    QEMU_PLUGIN_X86_CONTEXT_EFER,
+};
+typedef void (*qemu_plugin_x86_context_cb_t)(unsigned int cpu,
+    enum qemu_plugin_x86_context_kind kind, uint64_t operand,
+    const struct qemu_plugin_x86_paging *after);
+QEMU_PLUGIN_API
+void qemu_plugin_register_x86_context_cb(qemu_plugin_id_t id,
+                                         qemu_plugin_x86_context_cb_t cb);
+
+/* Experimental observed execution translations. Request during installation.
+ * Call only inside the successful memory callback with its original VA/info.
+ * Each result covers the original callback exactly once, split at target pages
+ * (4 KiB on x86). Crossing PAs are copied before execution from the resolved
+ * MMU lookup and published after success. Noncrossing operations use the
+ * original-address immediate callback TLB lookup (the existing hwaddr contract).
+ * Neither obtains a PA by reconstructing page tables.
+ * False is explicit unavailability; output is zero on failure. User mode is
+ * unavailable. No additional memory operation or arbitrary-address lookup.
+ * At most 16 bytes per slow-path TCG operation in this QEMU version; wider
+ * guest instructions can generate multiple independently identified callbacks.
+ */
+struct qemu_plugin_mem_segment {
+    uint64_t offset, size, va, pa;
+    bool is_io;
+};
+struct qemu_plugin_mem_access {
+    uint64_t va, size;
+    uint32_t info, count;
+    struct qemu_plugin_mem_segment segments[2];
+};
+QEMU_PLUGIN_API
+void qemu_plugin_request_mem_segments(void);
+QEMU_PLUGIN_API
+bool qemu_plugin_get_mem_segments(unsigned int vcpu_index,
+                                  qemu_plugin_meminfo_t info, uint64_t va,
+                                  struct qemu_plugin_mem_access *result);
 
 /* Returns true if state was captured, even if the walk status is not OK.
  * False means unavailable (wrong context/vCPU/target, or user emulation).

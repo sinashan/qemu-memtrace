@@ -304,6 +304,69 @@ struct qemu_plugin_hwaddr *qemu_plugin_get_hwaddr(qemu_plugin_meminfo_t info,
 #endif
 }
 
+void qemu_plugin_register_x86_context_cb(qemu_plugin_id_t id,
+                                         qemu_plugin_x86_context_cb_t cb)
+{
+    plugin_register_cb(id, QEMU_PLUGIN_EV_X86_CONTEXT, cb);
+}
+
+bool qemu_plugin_mem_segments_requested;
+
+void qemu_plugin_request_mem_segments(void)
+{
+    /* Monotonic opt-in; never retains a plugin function pointer. */
+    qatomic_set(&qemu_plugin_mem_segments_requested, true);
+}
+
+bool qemu_plugin_get_mem_segments(unsigned int vcpu_index,
+                                  qemu_plugin_meminfo_t info, uint64_t va,
+                                  struct qemu_plugin_mem_access *result)
+{
+    if (!result) {
+        return false;
+    }
+    memset(result, 0, sizeof(*result));
+#ifdef CONFIG_SOFTMMU
+    CPUState *cpu = current_cpu;
+    uint64_t size = UINT64_C(1) << qemu_plugin_mem_size_shift(info);
+    bool store = qemu_plugin_mem_is_store(info);
+    struct qemu_plugin_hwaddr first;
+
+    if (!cpu || cpu->cpu_index != vcpu_index || size > 16 ||
+        va > UINT64_MAX - (size - 1) ||
+        !qatomic_read(&qemu_plugin_mem_segments_requested)) {
+        return false;
+    }
+    if ((va & ~TARGET_PAGE_MASK) + size > TARGET_PAGE_SIZE) {
+        /* Never look up page two here: its execution translation is saved
+         * by the slow helper, before either access, and published only after
+         * both have returned successfully. Nested MMIO cannot overwrite it.
+         */
+        const struct qemu_plugin_mem_access *saved = &cpu->plugin_mem_access;
+        if (saved->count != 2 || saved->va != va || saved->size != size ||
+            get_mmuidx(saved->info) != get_mmuidx(info) ||
+            qemu_plugin_mem_is_store(saved->info) != store) {
+            return false;
+        }
+        *result = *saved;
+        return true;
+    }
+    if (!tlb_plugin_lookup(cpu, va, get_mmuidx(info), store, &first)) {
+        return false;
+    }
+    result->va = va;
+    result->size = size;
+    result->info = info;
+    result->count = 1;
+    result->segments[0] = (struct qemu_plugin_mem_segment) {
+        .size = size, .va = va, .pa = first.phys_addr, .is_io = first.is_io,
+    };
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool qemu_plugin_x86_paging_walk(unsigned int vcpu_index, uint64_t vaddr,
                                struct qemu_plugin_x86_walk *result)
 {
